@@ -2,9 +2,12 @@
 
 import (
     "encoding/json"
+    "fmt"
     "io"
     "net/http"
+    "net/url"
     "testing"
+    "time"
 )
 
 type NamespaceEntry struct {
@@ -27,14 +30,31 @@ type AllocationResponse struct {
     Data   []AllocationData `json:"data"`
 }
 
-func TestNegativeIdleValues(t *testing.T) {
-    url := "https://demo.infra.opencost.io/model/allocation/compute?window=2025-05-10T00:00:00Z,2025-05-11T00:00:00Z&aggregate=namespace&includeIdle=true&step=1d&accumulate=false"
 
-    resp, err := http.Get(url)
+func TestNegativeIdleCosts(t *testing.T) {
+    baseURL := "https://demo.infra.opencost.io/model/allocation/compute"
+
+    now := time.Now().UTC()
+    yesterday := now.Add(-24 * time.Hour)
+
+    q := url.Values{}
+    q.Set("window", fmt.Sprintf("%s,%s", yesterday.Format(time.RFC3339), now.Format(time.RFC3339)))
+    q.Set("aggregate", "namespace")
+    q.Set("includeIdle", "true")
+    q.Set("accumulate", "false")
+    q.Set("step", "1d")
+
+    fullURL := fmt.Sprintf("%s?%s", baseURL, q.Encode())
+
+    resp, err := http.Get(fullURL)
     if err != nil {
         t.Fatalf("Failed to fetch allocation data: %v", err)
     }
     defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        t.Fatalf("Expected HTTP 200 OK, got %d", resp.StatusCode)
+    }
 
     bodyBytes, err := io.ReadAll(resp.Body)
     if err != nil {
@@ -43,42 +63,39 @@ func TestNegativeIdleValues(t *testing.T) {
 
     var result AllocationResponse
     if err := json.Unmarshal(bodyBytes, &result); err != nil {
-        t.Fatalf("Failed to unmarshal JSON: %v\nRaw body:\n%s", err, bodyBytes)
+        t.Fatalf("Failed to unmarshal JSON: %v\nRaw body:\n%s", err, string(bodyBytes))
     }
 
     foundNegative := false
 
     for _, allocation := range result.Data {
         if idleEntry, exists := allocation["__idle__"]; exists {
-            t.Logf("Found __idle__ entry: CPU=$%.2f, GPU=$%.2f, RAM=$%.2f, PV=$%.2f, Total=$%.2f, Efficiency=%.2f",
-                idleEntry.CPUCost, idleEntry.GPUCost, idleEntry.RAMCost, idleEntry.PVCost, idleEntry.TotalCost, idleEntry.Efficiency)
+            t.Logf("Inspecting __idle__ entry: Total=$%.2f, CPU=$%.2f, RAM=$%.2f, GPU=$%.2f, PV=$%.2f",
+                idleEntry.TotalCost, idleEntry.CPUCost, idleEntry.RAMCost, idleEntry.GPUCost, idleEntry.PVCost)
 
-            t.Logf("Window start: %s | end: %s", idleEntry.Start, idleEntry.End)
+            negativeChecks := []struct {
+                name  string
+                value float64
+            }{
+                {"TotalCost", idleEntry.TotalCost},
+                {"CPUCost", idleEntry.CPUCost},
+                {"RAMCost", idleEntry.RAMCost},
+                {"GPUCost", idleEntry.GPUCost},
+                {"PVCost", idleEntry.PVCost},
+            }
 
-            if idleEntry.TotalCost < 0 {
-                t.Errorf("__idle__ entry has negative TotalCost: $%.2f", idleEntry.TotalCost)
-                foundNegative = true
-            }
-            if idleEntry.CPUCost < 0 {
-                t.Errorf("__idle__ entry has negative CPU cost: $%.2f", idleEntry.CPUCost)
-                foundNegative = true
-            }
-            if idleEntry.RAMCost < 0 {
-                t.Errorf("__idle__ entry has negative RAM cost: $%.2f", idleEntry.RAMCost)
-                foundNegative = true
-            }
-            if idleEntry.GPUCost < 0 {
-                t.Errorf("__idle__ entry has negative GPU cost: $%.2f", idleEntry.GPUCost)
-                foundNegative = true
+            for _, check := range negativeChecks {
+                if check.value < 0 {
+                    t.Errorf("__idle__ entry has negative %s: $%.4f", check.name, check.value)
+                    foundNegative = true
+                }
             }
         } else {
-            t.Log("No __idle__ entry found in this allocation.")
+            t.Log("No __idle__ entry found in allocation — skipping.")
         }
     }
 
     if !foundNegative {
-        t.Log("No negative idle-related values found — test passed.")
-    } else {
-        t.Log("Some negative idle-related values found — test failed.")
+        t.Log("No negative values found in __idle__ entry — test passed.")
     }
 }
